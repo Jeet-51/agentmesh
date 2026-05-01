@@ -1,0 +1,224 @@
+version: "3.9"
+
+# AgentMesh — full stack in one command: docker compose up --build
+#
+# Services
+# --------
+# gateway        :8000   API gateway + SSE stream (frontend entry point)
+# orchestrator   :8001   LangGraph orchestrator A2A server
+# research       :8002   CrewAI research crew A2A server
+# synthesis      :8003   Google ADK synthesis A2A server
+# yfinance-tool  :8011   MCP tool — yfinance (get_stock_price, get_financials)
+# wikipedia-tool :8012   MCP tool — Wikipedia (search, get_summary)
+# edgar-tool     :8013   MCP tool — SEC EDGAR (search_filings, get_10k)
+# frontend       :3000   React + TypeScript UI
+
+x-shared-env: &shared-env
+  PYTHONPATH: /shared:/app
+  LOG_FORMAT: json
+
+x-shared-vol: &shared-vol
+  - shared-code:/shared:ro      # shared/ package mounted read-only in every container
+
+services:
+
+  # -------------------------------------------------------------------------
+  # MCP tool servers — started first; synthesis depends on them
+  # -------------------------------------------------------------------------
+
+  yfinance-tool:
+    build:
+      context: ./agents/synthesis
+      dockerfile: Dockerfile
+    command: uvicorn mcp_tools.yfinance_tool:app --host 0.0.0.0 --port 8011
+    ports:
+      - "8011:8011"
+    environment:
+      <<: *shared-env
+      PORT: "8011"
+    volumes: *shared-vol
+    env_file: .env
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8011/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  wikipedia-tool:
+    build:
+      context: ./agents/synthesis
+      dockerfile: Dockerfile
+    command: uvicorn mcp_tools.wikipedia_tool:app --host 0.0.0.0 --port 8012
+    ports:
+      - "8012:8012"
+    environment:
+      <<: *shared-env
+      PORT: "8012"
+    volumes: *shared-vol
+    env_file: .env
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8012/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  edgar-tool:
+    build:
+      context: ./agents/synthesis
+      dockerfile: Dockerfile
+    command: uvicorn mcp_tools.edgar_tool:app --host 0.0.0.0 --port 8013
+    ports:
+      - "8013:8013"
+    environment:
+      <<: *shared-env
+      PORT: "8013"
+    volumes: *shared-vol
+    env_file: .env
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8013/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------------
+  # Agent services
+  # -------------------------------------------------------------------------
+
+  research:
+    build:
+      context: ./agents/research
+      dockerfile: Dockerfile
+    ports:
+      - "8002:8002"
+    environment:
+      <<: *shared-env
+      PORT: "8002"
+    volumes: *shared-vol
+    env_file: .env
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 20s
+      timeout: 8s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+  synthesis:
+    build:
+      context: ./agents/synthesis
+      dockerfile: Dockerfile
+    ports:
+      - "8003:8003"
+    environment:
+      <<: *shared-env
+      PORT: "8003"
+      YFINANCE_TOOL_URL: http://yfinance-tool:8011/sse
+      WIKIPEDIA_TOOL_URL: http://wikipedia-tool:8012/sse
+      EDGAR_TOOL_URL: http://edgar-tool:8013/sse
+    volumes: *shared-vol
+    env_file: .env
+    depends_on:
+      yfinance-tool:
+        condition: service_healthy
+      wikipedia-tool:
+        condition: service_healthy
+      edgar-tool:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 20s
+      timeout: 8s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+  orchestrator:
+    build:
+      context: ./agents/orchestrator
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8001"
+    environment:
+      <<: *shared-env
+      PORT: "8001"
+      RESEARCH_AGENT_URL: http://research:8002
+      SYNTHESIS_AGENT_URL: http://synthesis:8003
+    volumes: *shared-vol
+    env_file: .env
+    depends_on:
+      research:
+        condition: service_healthy
+      synthesis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 20s
+      timeout: 8s
+      retries: 3
+      start_period: 25s
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------------
+  # API gateway
+  # -------------------------------------------------------------------------
+
+  gateway:
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      <<: *shared-env
+      PORT: "8000"
+      ORCHESTRATOR_URL: http://orchestrator:8001
+      CORS_ORIGINS: "http://localhost:3000,http://127.0.0.1:3000"
+      GATEWAY_POLL_INTERVAL: "2.5"
+      GATEWAY_SSE_KEEPALIVE: "25.0"
+    volumes: *shared-vol
+    env_file: .env
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------------
+  # Frontend
+  # -------------------------------------------------------------------------
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:80"      # nginx serves on 80 inside, mapped to 3000 outside
+    environment:
+      REACT_APP_GATEWAY_URL: http://localhost:8000
+    depends_on:
+      gateway:
+        condition: service_healthy
+    restart: unless-stopped
+
+# -------------------------------------------------------------------------
+# Volumes
+# -------------------------------------------------------------------------
+
+volumes:
+  shared-code:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${PWD}/shared     # bind-mount the ./shared directory
