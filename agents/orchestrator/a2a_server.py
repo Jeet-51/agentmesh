@@ -47,12 +47,12 @@ from langgraph.errors import GraphInterrupt
 from langgraph.types import Command
 from pydantic import BaseModel
 
-from agents.orchestrator.checkpoints import (
+from checkpoints import (
     CheckpointPayload,
     create_checkpoint_router,
     store as checkpoint_store,
 )
-from agents.orchestrator.graph import graph
+from graph import graph
 from shared.a2a_server import TaskHandler, create_a2a_app
 from shared.models import (
     AgentMessage,
@@ -105,6 +105,15 @@ async def _run_graph(initial_state: OrchestratorState) -> None:
 
     Phase A: run until the human_checkpoint interrupt fires.
     Phase B: wait for the user's approval, then resume to completion.
+
+    LangGraph compatibility note
+    ----------------------------
+    In LangGraph >= 0.2, interrupt() inside a node ends the astream()
+    generator normally rather than raising GraphInterrupt.  The last
+    streamed state has status=AWAITING_HUMAN and the sub_tasks already
+    populated by decompose_query.  We detect this and register the
+    checkpoint from the state instead of from the exception payload.
+    GraphInterrupt is still caught for backward compatibility.
     """
     run_id = initial_state.run_id
     thread_config = {"configurable": {"thread_id": run_id}}
@@ -112,36 +121,35 @@ async def _run_graph(initial_state: OrchestratorState) -> None:
 
     bound_log.info("graph_runner.start")
 
+    # Save initial PENDING state immediately so the gateway's GET /run/{run_id}
+    # poll never sees a 404 while Phase A is still running.
+    await run_store.save(initial_state)
+
     # ------------------------------------------------------------------
     # Phase A — run up to the interrupt
     # ------------------------------------------------------------------
+    last_event: dict[str, Any] = {}
+    interrupt_value: dict[str, Any] | None = None
+
     try:
         async for event in graph.astream(
             initial_state.model_dump(mode="json"),
             config=thread_config,
             stream_mode="values",
         ):
-            # Each streamed event is the full state after a node completes.
+            last_event = event
             node_status = event.get("status")
             bound_log.debug("graph_runner.stream_event", status=node_status)
 
     except GraphInterrupt as interrupt_exc:
-        # interrupt() fired inside human_checkpoint.
-        interrupt_value: dict[str, Any] = interrupt_exc.args[0] if interrupt_exc.args else {}
-        bound_log.info("graph_runner.interrupt_fired", interrupt_keys=list(interrupt_value.keys()))
-
-        payload = CheckpointPayload(
-            run_id=run_id,
-            trace_id=initial_state.trace_id,
-            sub_tasks=interrupt_value.get("sub_tasks", []),
-            message=interrupt_value.get("message", "Awaiting human approval"),
-        )
-        ready_event = await checkpoint_store.register(payload)
-
-        # Block until the user submits their decision via POST /checkpoint/{run_id}.
-        bound_log.info("graph_runner.awaiting_human")
-        await ready_event.wait()
-        bound_log.info("graph_runner.human_responded")
+        # LangGraph < 0.2 path: exception carries the interrupt payload.
+        raw = interrupt_exc.args[0] if interrupt_exc.args else {}
+        interrupt_value = {
+            "sub_tasks": raw.get("sub_tasks", []),
+            "message": raw.get("message", "Awaiting human approval"),
+        }
+        bound_log.info("graph_runner.interrupt_fired",
+                       sub_task_count=len(interrupt_value["sub_tasks"]))
 
     except Exception as exc:
         bound_log.error("graph_runner.phase_a_error", error=str(exc))
@@ -150,6 +158,64 @@ async def _run_graph(initial_state: OrchestratorState) -> None:
         )
         await run_store.save(failed_state)
         return
+
+    # LangGraph >= 0.2 path: stream ended normally at the interrupt point.
+    # Detect by checking whether the last state has status=awaiting_human.
+    if interrupt_value is None:
+        last_status = last_event.get("status")
+        is_awaiting = last_status in (
+            ReportStatus.AWAITING_HUMAN,
+            ReportStatus.AWAITING_HUMAN.value,
+        )
+        if is_awaiting:
+            # sub_tasks may be SubTask objects or plain dicts depending on
+            # how LangGraph serialised them — normalise to dicts either way.
+            raw_tasks = last_event.get("sub_tasks", [])
+            sub_tasks_dicts: list[dict[str, Any]] = [
+                t.model_dump(mode="json") if hasattr(t, "model_dump") else dict(t)
+                for t in raw_tasks
+            ]
+            interrupt_value = {
+                "sub_tasks": sub_tasks_dicts,
+                "message": "Awaiting human approval",
+            }
+            bound_log.info("graph_runner.interrupt_detected_from_state",
+                           sub_task_count=len(sub_tasks_dicts))
+        else:
+            # Stream completed without reaching a checkpoint — unexpected.
+            bound_log.warning("graph_runner.no_interrupt_detected", last_status=last_status)
+            return
+
+    # Persist the AWAITING_HUMAN state with sub_tasks so the gateway's
+    # GET /run/{run_id} poll returns the correct status and task list.
+    from shared.models import SubTask as SubTaskModel
+    awaiting_sub_tasks = [
+        SubTaskModel.model_validate(t) if isinstance(t, dict) else t
+        for t in interrupt_value["sub_tasks"]
+    ]
+    awaiting_state = initial_state.model_copy(
+        update={
+            "status": ReportStatus.AWAITING_HUMAN,
+            "sub_tasks": awaiting_sub_tasks,
+            "updated_at": _utcnow(),
+        }
+    )
+    await run_store.save(awaiting_state)
+    bound_log.info("graph_runner.awaiting_human_state_saved",
+                   sub_task_count=len(awaiting_sub_tasks))
+
+    # Register the checkpoint and block until the human responds.
+    payload = CheckpointPayload(
+        run_id=run_id,
+        trace_id=initial_state.trace_id,
+        sub_tasks=interrupt_value["sub_tasks"],
+        message=interrupt_value["message"],
+    )
+    ready_event = await checkpoint_store.register(payload)
+
+    bound_log.info("graph_runner.awaiting_human")
+    await ready_event.wait()
+    bound_log.info("graph_runner.human_responded")
 
     # ------------------------------------------------------------------
     # Phase B — resume after human approval
@@ -270,6 +336,7 @@ def create_app() -> FastAPI:
             "run_id": run_id,
             "status": state.status.value,
             "query": state.query,
+            "sub_tasks": [t.model_dump(mode="json") for t in state.sub_tasks],
             "sub_task_count": len(state.sub_tasks),
         }
 

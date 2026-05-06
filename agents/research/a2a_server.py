@@ -19,7 +19,7 @@ import os
 import structlog
 import uvicorn
 
-from agents.research.crew import ResearchCrew
+from crew import ResearchCrew
 from shared.a2a_server import TaskHandler, create_a2a_app
 from shared.models import AgentMessage, Framework, SubTask, TaskCard
 

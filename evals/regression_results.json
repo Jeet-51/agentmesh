@@ -1,0 +1,26 @@
+{
+  "run_at": "2026-05-05T03:08:02.647980+00:00",
+  "total_elapsed_min": 4.9,
+  "passed": 2,
+  "total": 3,
+  "results": [
+    {
+      "query": "What are the key risks in biotech sector for 2026?",
+      "status": "completed",
+      "run_id": "30a60679-5118-4dec-b69c-e704e6c55081",
+      "elapsed_s": 116
+    },
+    {
+      "query": "Analyze Amazon AWS vs Google Cloud market share",
+      "status": "completed",
+      "run_id": "22b84425-a6f1-4b86-ba9f-06f34c1c2476",
+      "elapsed_s": 116
+    },
+    {
+      "query": "What is the impact of tariffs on US manufacturing stocks?",
+      "status": "failed",
+      "run_id": "66804d0c-8de9-463c-8bc4-5c862bacc69b",
+      "elapsed_s": 41
+    }
+  ]
+}

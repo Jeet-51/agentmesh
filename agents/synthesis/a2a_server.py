@@ -24,7 +24,7 @@ import structlog
 import uvicorn
 from fastapi import FastAPI
 
-from agents.synthesis.agent import SynthesisAgent
+from agent import SynthesisAgent
 from shared.a2a_server import TaskHandler, create_a2a_app
 from shared.models import AgentMessage, Framework, ResearchFindings, TaskCard
 

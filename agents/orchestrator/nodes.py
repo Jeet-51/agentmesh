@@ -19,8 +19,9 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
-import google.generativeai as genai
 import structlog
+from google import genai
+from google.genai import types as genai_types
 from langgraph.types import interrupt
 
 from shared.a2a_client import A2AClient, A2AClientError
@@ -41,21 +42,20 @@ log = structlog.get_logger(__name__)
 RESEARCH_AGENT_URL = os.environ.get("RESEARCH_AGENT_URL", "http://research:8002")
 SYNTHESIS_AGENT_URL = os.environ.get("SYNTHESIS_AGENT_URL", "http://synthesis:8003")
 
-# Module-level singleton — configure once, reuse across calls.
-_gemini_model: genai.GenerativeModel | None = None
+# Module-level singleton — configured once, reused across calls.
+_gemini_client: genai.Client | None = None
 
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _gemini() -> genai.GenerativeModel:
-    """Return the cached Gemini Flash model, initialising on first call."""
-    global _gemini_model
-    if _gemini_model is None:
-        genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
-        _gemini_model = genai.GenerativeModel("gemini-2.0-flash")
-    return _gemini_model
+def _gemini() -> genai.Client:
+    """Return the cached google-genai Client, initialising on first call."""
+    global _gemini_client
+    if _gemini_client is None:
+        _gemini_client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
+    return _gemini_client
 
 
 # ---------------------------------------------------------------------------
@@ -113,12 +113,13 @@ async def decompose_query(state: OrchestratorState) -> dict[str, Any]:
     prompt = _DECOMPOSE_PROMPT.format(query=state.query, feedback_block=feedback_block)
 
     try:
-        response = await _gemini().generate_content_async(
-            prompt,
-            generation_config=genai.GenerationConfig(
+        response = await _gemini().aio.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(
                 response_mime_type="application/json",
                 temperature=0.2,
-                max_output_tokens=1024,
+                max_output_tokens=4096,
             ),
         )
     except Exception as exc:

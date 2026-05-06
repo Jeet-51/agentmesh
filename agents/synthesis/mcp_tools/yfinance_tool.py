@@ -5,8 +5,9 @@ Exposes two MCP tools:
   get_stock_price(ticker)      — real-time price, volume, market cap, 52-week range
   get_financials(ticker)       — trailing P/E, revenue, earnings, margins, debt/equity
 
-Transport: MCP over SSE (GET /sse + POST /messages).
-The ADK synthesis agent connects via SseServerParams(url="http://yfinance-tool:8011/sse").
+Transport: MCP over SSE using a pure ASGI app (mcp>=1.24 compatible).
+FastAPI is NOT used for the SSE/messages routes to avoid the ASGI double-response
+RuntimeError that occurs when FastAPI wraps SSE connections.
 """
 
 from __future__ import annotations
@@ -17,10 +18,11 @@ import os
 import structlog
 import uvicorn
 import yfinance as yf
-from fastapi import FastAPI, Request
 from mcp import types
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
+from mcp.server.transport_security import TransportSecuritySettings
+from starlette.responses import JSONResponse
 
 log = structlog.get_logger(__name__)
 
@@ -29,7 +31,12 @@ log = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 server = Server("yfinance-tool")
-transport = SseServerTransport("/messages/")
+# Disable DNS rebinding protection — safe for Docker internal networking where
+# containers connect by hostname (e.g., yfinance-tool:8011).
+transport = SseServerTransport(
+    "/messages/",
+    security_settings=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+)
 
 
 @server.list_tools()
@@ -91,26 +98,44 @@ async def call_tool(
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _fmt_number(value: int | float | None, prefix: str = "$") -> str | None:
+    """Format large numbers as human-readable strings (e.g. $1.23B, $456.78M)."""
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if abs(v) >= 1e12:
+        return f"{prefix}{v / 1e12:.2f}T"
+    if abs(v) >= 1e9:
+        return f"{prefix}{v / 1e9:.2f}B"
+    if abs(v) >= 1e6:
+        return f"{prefix}{v / 1e6:.2f}M"
+    return f"{prefix}{v:,.0f}"
+
+
+# ---------------------------------------------------------------------------
 # Tool implementations
 # ---------------------------------------------------------------------------
 
 
 def _get_stock_price(ticker: str) -> dict:
-    """Fetch real-time price data from yfinance."""
     if not ticker:
         return {"error": "ticker is required"}
     try:
         t = yf.Ticker(ticker.upper())
         info = t.info
-
         price = info.get("currentPrice") or info.get("regularMarketPrice")
         prev_close = info.get("previousClose") or info.get("regularMarketPreviousClose")
         change_pct = (
             round(((price - prev_close) / prev_close) * 100, 2)
-            if price and prev_close
-            else None
+            if price and prev_close else None
         )
-
         return {
             "ticker": ticker.upper(),
             "price": price,
@@ -131,17 +156,15 @@ def _get_stock_price(ticker: str) -> dict:
 
 
 def _get_financials(ticker: str) -> dict:
-    """Fetch key financial metrics from yfinance."""
     if not ticker:
         return {"error": "ticker is required"}
     try:
         t = yf.Ticker(ticker.upper())
         info = t.info
-
-        # Revenue and earnings from income statement (TTM where available).
-        revenue = info.get("totalRevenue")
-        net_income = info.get("netIncomeToCommon")
-
+        revenue      = info.get("totalRevenue")
+        net_income   = info.get("netIncomeToCommon")
+        free_cf      = info.get("freeCashflow")
+        market_cap   = info.get("marketCap")
         return {
             "ticker": ticker.upper(),
             "company_name": info.get("longName"),
@@ -151,15 +174,37 @@ def _get_financials(ticker: str) -> dict:
             "forward_pe": info.get("forwardPE"),
             "price_to_sales": info.get("priceToSalesTrailing12Months"),
             "price_to_book": info.get("priceToBook"),
-            "revenue_ttm": revenue,
-            "net_income_ttm": net_income,
-            "gross_margins": info.get("grossMargins"),
-            "operating_margins": info.get("operatingMargins"),
-            "profit_margins": info.get("profitMargins"),
+            # Raw values (for programmatic use)
+            "revenue_ttm_raw": revenue,
+            "net_income_ttm_raw": net_income,
+            "free_cashflow_raw": free_cf,
+            "market_cap_raw": market_cap,
+            # Formatted strings (for LLM readability)
+            "revenue_ttm": _fmt_number(revenue),
+            "net_income_ttm": _fmt_number(net_income),
+            "free_cashflow": _fmt_number(free_cf),
+            "market_cap": _fmt_number(market_cap),
+            "gross_margins": (
+                f"{info.get('grossMargins') * 100:.1f}%"
+                if info.get("grossMargins") is not None else None
+            ),
+            "operating_margins": (
+                f"{info.get('operatingMargins') * 100:.1f}%"
+                if info.get("operatingMargins") is not None else None
+            ),
+            "profit_margins": (
+                f"{info.get('profitMargins') * 100:.1f}%"
+                if info.get("profitMargins") is not None else None
+            ),
             "debt_to_equity": info.get("debtToEquity"),
-            "return_on_equity": info.get("returnOnEquity"),
-            "return_on_assets": info.get("returnOnAssets"),
-            "free_cashflow": info.get("freeCashflow"),
+            "return_on_equity": (
+                f"{info.get('returnOnEquity') * 100:.1f}%"
+                if info.get("returnOnEquity") is not None else None
+            ),
+            "return_on_assets": (
+                f"{info.get('returnOnAssets') * 100:.1f}%"
+                if info.get("returnOnAssets") is not None else None
+            ),
             "beta": info.get("beta"),
             "source": "yfinance",
         }
@@ -169,36 +214,38 @@ def _get_financials(ticker: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# FastAPI app — MCP over SSE
+# Pure ASGI app — direct routing preserves scope["root_path"] = "" so that
+# SseServerTransport.connect_sse() advertises "/messages/" (not "/sse/messages/")
+# to the MCP client as the POST endpoint.
+# DNS rebinding protection is disabled via TransportSecuritySettings above so
+# Docker container hostnames (yfinance-tool:8011) are accepted.
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="YFinance MCP Tool", version="1.0.0")
+async def app(scope, receive, send):
+    if scope["type"] == "lifespan":
+        await receive()
+        await send({"type": "lifespan.startup.complete"})
+        await receive()
+        await send({"type": "lifespan.shutdown.complete"})
+        return
 
+    path   = scope.get("path", "")
+    method = scope.get("method", "GET")
 
-@app.get("/sse")
-async def sse_endpoint(request: Request) -> None:
-    """SSE stream — the ADK agent connects here to use MCP tools."""
-    async with transport.connect_sse(
-        request.scope, request.receive, request._send
-    ) as streams:
-        await server.run(
-            streams[0],
-            streams[1],
-            server.create_initialization_options(),
-        )
+    if path == "/sse" and method == "GET":
+        async with transport.connect_sse(scope, receive, send) as streams:
+            await server.run(streams[0], streams[1], server.create_initialization_options())
 
+    elif path.startswith("/messages/"):
+        await transport.handle_post_message(scope, receive, send)
 
-@app.post("/messages/")
-async def handle_messages(request: Request) -> None:
-    """MCP message endpoint — used for client-to-server messages in SSE mode."""
-    await transport.handle_post_message(
-        request.scope, request.receive, request._send
-    )
+    elif path == "/health":
+        response = JSONResponse({"status": "ok", "service": "yfinance-mcp-tool", "port": 8011})
+        await response(scope, receive, send)
 
-
-@app.get("/health")
-async def health() -> dict:
-    return {"status": "ok", "service": "yfinance-mcp-tool", "port": 8011}
+    else:
+        response = JSONResponse({"error": "not found"}, status_code=404)
+        await response(scope, receive, send)
 
 
 if __name__ == "__main__":

@@ -63,6 +63,18 @@ from sse_starlette.sse import EventSourceResponse
 from shared.a2a_client import A2AClient, A2AClientError
 from shared.models import Framework, TaskCard
 
+# ── Eval framework (optional — gracefully absent when evals/ not mounted) ────
+try:
+    from evals.eval_runner import run_eval
+    from evals.storage.eval_db import (
+        init_db as _eval_init_db,
+        save_report as _eval_save_report,
+        get_all_scores as _eval_get_all_scores,
+    )
+    _EVALS_AVAILABLE = True
+except ImportError:
+    _EVALS_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # Structured logging
 # ---------------------------------------------------------------------------
@@ -337,6 +349,12 @@ async def _poll_orchestrator(run: _GatewayRun) -> None:
 
             if current_status in _TERMINAL:
                 bound_log.info("gateway.poller.terminal", status=current_status)
+                # Fire-and-forget eval scoring for completed runs
+                if current_status == "completed" and _EVALS_AVAILABLE:
+                    asyncio.create_task(
+                        _run_eval_background(run, data),
+                        name=f"eval-{run.run_id}",
+                    )
                 break
 
     bound_log.info("gateway.poller.done")
@@ -354,6 +372,74 @@ async def _emit(run: _GatewayRun, event_type: str, data: dict[str, Any]) -> None
     await run.emit(event)
 
 
+async def _run_eval_background(run: _GatewayRun, orch_data: dict[str, Any]) -> None:
+    """
+    Fire-and-forget coroutine: score the final report and persist to SQLite.
+
+    Runs in a background asyncio task so it never blocks the SSE stream or
+    the poller.  All exceptions are caught and logged — a failing eval must
+    never crash the gateway.
+    """
+    if not _EVALS_AVAILABLE:
+        return
+    try:
+        report: dict[str, Any] = orch_data.get("final_report") or {}
+        if not report:
+            return
+
+        narrative: str  = report.get("narrative", "") or ""
+        sources:   list = report.get("citations", []) or []
+        conf_scores     = report.get("confidence_scores", {}) or {}
+        confidence: float = (
+            sum(conf_scores.values()) / len(conf_scores) if conf_scores else 0.0
+        )
+
+        # Save raw report first
+        _eval_save_report(
+            report_id=run.run_id,
+            query=run.query,
+            report_json=report,
+            sources_json=sources,
+            confidence=confidence,
+        )
+
+        # Extract numeric ground-truth from yfinance citations for quantitative metric
+        import re as _re
+        yfinance_data: dict = {}
+        for c in sources:
+            if c.get("tool_used") != "yfinance":
+                continue
+            claim = c.get("claim", "") or ""
+            title = c.get("source_title", f"yf_{len(yfinance_data)}")
+            for i, n in enumerate(_re.findall(r"\b\d[\d,]*\.?\d*\b", claim.replace(",", ""))[:4]):
+                try:
+                    yfinance_data[f"{title}_{i}"] = float(n)
+                except ValueError:
+                    pass
+
+        # Run in a thread so SQLite blocking IO doesn't hold the event loop
+        loop = asyncio.get_event_loop()
+        scores = await loop.run_in_executor(
+            None,
+            lambda: run_eval(
+                report_id=run.run_id,
+                query=run.query,
+                narrative=narrative,
+                sources=sources,
+                yfinance_data=yfinance_data or None,
+                confidence=confidence,
+                report_json=report,
+            ),
+        )
+        log.info(
+            "gateway.evals.scored",
+            run_id=run.run_id,
+            overall=scores.get("overall", {}).get("score"),
+        )
+    except Exception as exc:
+        log.warning("gateway.evals.error", run_id=run.run_id, error=str(exc))
+
+
 # ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
@@ -361,7 +447,13 @@ async def _emit(run: _GatewayRun, event_type: str, data: dict[str, Any]) -> None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("gateway.startup", orchestrator_url=ORCHESTRATOR_URL)
+    log.info("gateway.startup", orchestrator_url=ORCHESTRATOR_URL, evals=_EVALS_AVAILABLE)
+    if _EVALS_AVAILABLE:
+        try:
+            _eval_init_db()
+            log.info("gateway.evals.db_ready")
+        except Exception as exc:
+            log.warning("gateway.evals.db_init_failed", error=str(exc))
     yield
     log.info("gateway.shutdown")
 
@@ -665,6 +757,70 @@ async def approve_checkpoint(run_id: str, body: ApprovalRequest) -> dict[str, An
             else "Rejected. Orchestrator will re-decompose the query."
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# GET /evals/scores  — serve eval results to the frontend dashboard
+# ---------------------------------------------------------------------------
+
+
+@app.get("/evals/scores")
+async def get_eval_scores(limit: int = 20) -> dict[str, Any]:
+    """
+    Return the latest eval scores grouped by report for the frontend dashboard.
+
+    Each report contains all metric scores plus metadata (query, timestamp).
+    Returns an empty list when evals are unavailable or the DB has no rows.
+    """
+    if not _EVALS_AVAILABLE:
+        return {"available": False, "reports": []}
+
+    try:
+        rows = await asyncio.get_event_loop().run_in_executor(
+            None, _eval_get_all_scores
+        )
+    except Exception as exc:
+        log.warning("gateway.evals.scores_fetch_error", error=str(exc))
+        return {"available": True, "reports": []}
+
+    # Group rows by (timestamp, query) — same logic as dashboard.py
+    from collections import defaultdict
+    by_report: dict = defaultdict(dict)
+    meta: dict = {}
+    for query, conf, ts, metric, score, details in rows:
+        key = (ts, query)
+        by_report[key][metric] = score
+        meta[key] = {"query": query, "confidence": conf, "timestamp": ts}
+
+    # Sort newest first, cap at limit
+    sorted_keys = sorted(by_report.keys(), key=lambda k: k[0], reverse=True)[:limit]
+
+    reports = []
+    for key in sorted_keys:
+        m = by_report[key]
+        info = meta[key]
+        reports.append({
+            "query":     info["query"],
+            "timestamp": info["timestamp"],
+            "confidence": info["confidence"],
+            "scores": {
+                "hallucination":         m.get("hallucination"),
+                "quantitative":          m.get("quantitative"),
+                "freshness":             m.get("freshness"),
+                "diversity":             m.get("diversity"),
+                "entity_coverage":       m.get("entity_coverage"),
+                "narrative_length":      m.get("narrative_length"),
+                "source_credibility":    m.get("source_credibility"),
+                "fictional_premise":     m.get("fictional_premise"),
+                "answer_relevance":      m.get("answer_relevance"),
+                "tool_activation":       m.get("tool_activation"),
+                "citation_density":      m.get("citation_density"),
+                "confidence_calibration":m.get("confidence_calibration"),
+                "overall":               m.get("overall"),
+            },
+        })
+
+    return {"available": True, "reports": reports}
 
 
 # ---------------------------------------------------------------------------

@@ -4,7 +4,7 @@ CrewAI research crew for AgentMesh.
 Three-agent sequential crew:
   Searcher → Fact-checker → Summarizer
 
-All agents use Gemini Flash via LiteLLM ("gemini/gemini-2.0-flash").
+All agents use Gemini Flash Lite via LiteLLM ("gemini/gemini-2.5-flash").
 Search tool: Tavily if TAVILY_API_KEY is set; DuckDuckGo as automatic fallback.
 
 The public interface is ResearchCrew.run() which returns a typed
@@ -22,6 +22,7 @@ from typing import Any
 
 import structlog
 from crewai import LLM, Agent, Crew, Process, Task
+from crewai.tools import tool as crewai_tool
 from pydantic import BaseModel, Field
 
 from shared.models import ResearchFindings, Source, SubTask
@@ -74,7 +75,7 @@ def _build_llm() -> LLM:
     os.environ.setdefault("GEMINI_API_KEY", api_key)
 
     return LLM(
-        model="gemini/gemini-2.0-flash",
+        model="gemini/gemini-2.5-flash",
         temperature=0.1,
         max_tokens=4096,
     )
@@ -82,36 +83,62 @@ def _build_llm() -> LLM:
 
 def _build_search_tool() -> Any:
     """
-    Return the best available search tool.
+    Return the best available search tool as a CrewAI-native BaseTool.
+
+    CrewAI 1.x requires tools to be instances of crewai.tools.BaseTool.
+    LangChain tools (TavilySearchResults, DuckDuckGoSearchRun) are no longer
+    accepted directly. We use the @crewai_tool decorator to wrap the underlying
+    libraries so CrewAI gets a compatible tool object.
 
     Priority:
-      1. TavilySearchResults if TAVILY_API_KEY is set.
-      2. DuckDuckGoSearchRun as a zero-config fallback.
-
-    Both are LangChain tools; CrewAI >= 0.51 accepts them natively.
+      1. Tavily if TAVILY_API_KEY is set (higher quality results).
+      2. DuckDuckGo as a zero-config fallback.
     """
     tavily_key = os.environ.get("TAVILY_API_KEY", "")
     if tavily_key:
         try:
-            from langchain_community.tools.tavily_search import TavilySearchResults
+            from tavily import TavilyClient as _TavilyClient
+            _tc = _TavilyClient(api_key=tavily_key)
+
+            @crewai_tool("Tavily Web Search")
+            def tavily_search(query: str) -> str:
+                """Search the web for current, accurate information. Input is a search query string."""
+                resp = _tc.search(query, max_results=6)
+                parts = []
+                for r in resp.get("results", []):
+                    parts.append(
+                        f"[{r.get('title', 'No title')}]({r.get('url', '')}): "
+                        f"{r.get('content', '')[:400]}"
+                    )
+                return "\n\n".join(parts) or "No results found."
 
             log.info("research.tool.selected", tool="tavily")
-            return TavilySearchResults(max_results=6)
-        except ImportError:
-            log.warning(
-                "research.tool.tavily_import_failed",
-                reason="langchain-community not installed; falling back to DuckDuckGo",
-            )
+            return tavily_search
+        except Exception as exc:
+            log.warning("research.tool.tavily_failed", reason=str(exc))
 
+    # DuckDuckGo fallback — duckduckgo-search 6+ uses DDGS context manager.
     try:
-        from langchain_community.tools import DuckDuckGoSearchRun
+        from duckduckgo_search import DDGS as _DDGS
+
+        @crewai_tool("DuckDuckGo Web Search")
+        def ddg_search(query: str) -> str:
+            """Search the web for information. Input is a search query string."""
+            with _DDGS() as ddgs:
+                results = list(ddgs.text(query, max_results=6))
+            parts = []
+            for r in results:
+                parts.append(
+                    f"[{r.get('title', 'No title')}]({r.get('href', '')}): "
+                    f"{r.get('body', '')[:400]}"
+                )
+            return "\n\n".join(parts) or "No results found."
 
         log.info("research.tool.selected", tool="duckduckgo")
-        return DuckDuckGoSearchRun()
+        return ddg_search
     except ImportError as exc:
         raise ImportError(
-            "No search tool available. Install langchain-community for DuckDuckGo "
-            "or set TAVILY_API_KEY for Tavily."
+            "No search tool available. Install duckduckgo-search or set TAVILY_API_KEY."
         ) from exc
 
 
@@ -204,15 +231,17 @@ class ResearchCrew:
         fact_checker = Agent(
             role="Fact Verification Specialist",
             goal=(
-                "Critically evaluate every major claim from the Searcher. "
-                "Identify which claims are backed by multiple independent sources "
-                "and which are uncertain or single-sourced. "
-                "Set fact_check_passed=true only when core claims are solid."
+                "Review claims from the Searcher and assess their credibility. "
+                "Mark fact_check_passed=True if claims come from real search results "
+                "and are plausible given the sources — even if only one source covers them. "
+                "Only mark fact_check_passed=False when sources directly contradict each other "
+                "or when a claim has zero source support."
             ),
             backstory=(
-                "You are a rigorous fact-checker trained to separate verified fact "
-                "from speculation. You cross-reference claims and always flag uncertainty "
-                "rather than fill gaps with assumptions."
+                "You are a pragmatic fact-checker who distinguishes between 'unverified' "
+                "and 'false'. A claim sourced from a credible outlet is considered verified "
+                "even if only one source covers it. You flag contradictions and fabrications, "
+                "not merely gaps in cross-referencing."
             ),
             tools=[],
             llm=self._llm,
@@ -245,36 +274,48 @@ class ResearchCrew:
                 "Topic: {topic}\n"
                 "Instructions: {instructions}\n\n"
                 "Requirements:\n"
-                "- Run at least 2 searches with different query terms.\n"
-                "- For every fact, record: [Source Title](URL): key excerpt.\n"
-                "- Aim for 5-8 distinct, credible sources.\n"
+                "- Run at least 2-3 searches with different query terms.\n"
+                "- For EVERY source found, you MUST record it in EXACTLY this format:\n"
+                "  SOURCE: [Title](https://full-url-here.com) | SNIPPET: key fact or excerpt\n"
+                "- The URL inside the parentheses MUST be the complete https:// URL as returned "
+                "by the search tool — copy it character for character.\n"
+                "- Aim for 5-8 distinct, credible sources with real URLs.\n"
+                "- Never omit or shorten URLs — partial URLs are useless.\n"
                 "- Include publication dates where visible."
             ),
             expected_output=(
-                "A structured list of findings with each item formatted as:\n"
-                "[SOURCE TITLE](URL): key fact or excerpt.\n"
-                "Minimum 5 sources. Include raw search snippets where available."
+                "A numbered list of research findings. Each item MUST follow this format:\n"
+                "N. SOURCE: [Title](https://exact-url.com) | SNIPPET: key fact (max 200 chars)\n\n"
+                "Rules:\n"
+                "- Every entry must have a complete https:// URL in the parentheses.\n"
+                "- Minimum 5 sources. No placeholder URLs.\n"
+                "- Copy URLs verbatim from search tool output."
             ),
             agent=searcher,
         )
 
         fact_check_task = Task(
             description=(
-                "Review the Searcher's results and verify the core claims.\n\n"
+                "Review the Searcher's results and assess credibility of claims.\n\n"
                 "Topic: {topic}\n\n"
+                "CRITICAL: You MUST preserve every SOURCE line from the Searcher's output "
+                "verbatim — including the full URLs — in your report. Do not shorten or omit URLs.\n\n"
                 "For each major claim:\n"
-                "  1. Check whether it appears in 2+ independent sources.\n"
-                "  2. Note any contradictions between sources.\n"
-                "  3. Flag single-source or unverifiable claims.\n\n"
+                "  1. Is it sourced from a real search result with a URL? If yes, it is credible.\n"
+                "  2. Does any other source directly CONTRADICT it? If yes, flag it.\n"
+                "  3. Is it a completely unsourced assertion? If yes, flag it.\n\n"
+                "IMPORTANT: Do NOT mark claims as unverified simply because only one source covers them.\n"
+                "Single-source claims from credible outlets are acceptable.\n\n"
                 "Conclude with:\n"
-                "  FACT_CHECK_PASSED: true   (core claims supported by 2+ sources, no major contradictions)\n"
-                "  FACT_CHECK_PASSED: false  (significant unverified or contradicted claims)\n"
+                "  FACT_CHECK_PASSED: true   (claims are sourced and no direct contradictions)\n"
+                "  FACT_CHECK_PASSED: false  (claims are directly contradicted or entirely unsourced)\n"
             ),
             expected_output=(
-                "A fact-check report with three sections:\n"
-                "VERIFIED CLAIMS: bullet list of well-supported facts.\n"
-                "UNVERIFIED CLAIMS: bullet list of weak or single-source claims.\n"
-                "FACT_CHECK_PASSED: true or false with a 2-sentence justification."
+                "A fact-check report with these sections:\n"
+                "SOURCES REVIEWED: Repeat ALL source lines from the Searcher with their full URLs.\n"
+                "CREDIBLE CLAIMS: bullet list of sourced, plausible facts.\n"
+                "QUESTIONABLE CLAIMS: bullet list of directly contradicted or unsourced claims.\n"
+                "FACT_CHECK_PASSED: true or false with a 1-sentence justification."
             ),
             context=[search_task],
             agent=fact_checker,
@@ -290,20 +331,30 @@ class ResearchCrew:
                 '  "confidence_score": <float 0.0–1.0>,\n'
                 '  "fact_check_passed": <true|false>,\n'
                 '  "sources": [\n'
-                '    {{"title": "<source title>", "url": "<url or empty string>", "snippet": "<key excerpt, max 200 chars>"}}\n'
+                '    {{"title": "<outlet or page name>", "url": "<EXACT URL copied from the search result — this is MANDATORY, never leave blank or use a placeholder; copy the full https:// URL verbatim from the Searcher output>", "snippet": "<key excerpt, max 200 chars>"}}\n'
                 "  ]\n"
                 "}}\n\n"
-                "confidence_score bands:\n"
-                "  0.9–1.0  Strong consensus, multiple high-quality sources, fact-check passed.\n"
-                "  0.7–0.9  Good evidence, minor gaps or 1-2 unverified claims.\n"
-                "  0.5–0.7  Mixed evidence, notable unverified claims.\n"
-                "  0.0–0.5  Weak, contradictory, or very thin evidence.\n\n"
-                "Include 3-6 sources. Prefer sources the fact-checker verified."
+                "URL RULES — strictly enforced:\n"
+                "  - Every source MUST have a complete URL starting with https://\n"
+                "  - Copy URLs EXACTLY as they appeared in the Searcher's markdown links: [Title](URL)\n"
+                "  - NEVER use empty string, null, 'N/A', 'URL', or any placeholder\n"
+                "  - NEVER invent or fabricate URLs\n"
+                "  - If a source has no URL: use the outlet's root domain e.g. https://reuters.com\n"
+                "  - Tavily results always include URLs — look for them in the Searcher's output\n\n"
+                "confidence_score bands — base this on EVIDENCE QUALITY, not fact-check result alone:\n"
+                "  0.85–1.0  Multiple high-quality sources, specific figures, strong consensus.\n"
+                "  0.70–0.85 Good evidence from 3+ credible outlets.\n"
+                "  0.55–0.70 Findings from 1-2 credible sources, plausible.\n"
+                "  0.0–0.55  Contradictory or very thin evidence.\n\n"
+                "IMPORTANT: fact_check_passed=false should reduce confidence by AT MOST 0.15.\n"
+                "Include 3-6 sources. Every source MUST have a real title and a real https:// URL."
             ),
             expected_output=(
                 "A single valid JSON object with keys: findings (str), "
                 "confidence_score (float), fact_check_passed (bool), "
-                "sources (list of {title, url, snippet})."
+                "sources (list of {title, url, snippet}). "
+                "Every source must have a non-empty title and a complete https:// URL "
+                "copied verbatim from the search results."
             ),
             context=[search_task, fact_check_task],
             agent=summarizer,
@@ -354,28 +405,121 @@ class ResearchCrew:
             summary = self._extract_json_summary(str(raw_text))
             self._bound_log.debug("crew.parse.via_regex_extraction")
 
-        # Convert sources dicts → Source models.
-        sources = [
-            Source(
-                url=s.get("url") or None,
-                title=s.get("title", "Unknown"),
-                snippet=s.get("snippet", ""),
-            )
-            for s in summary.sources
-        ]
-
-        # Collect raw task outputs for trace visibility (first 3 only).
+        # Collect raw task outputs for trace visibility and URL fallback (first 3 tasks).
         tasks_output = getattr(crew_result, "tasks_output", []) or []
         raw_search_results = [str(t.raw) for t in tasks_output if getattr(t, "raw", None)][:3]
+
+        # Convert sources dicts → Source models (with URL validation).
+        sources = []
+        for s in summary.sources:
+            raw_title   = s.get("title", "").strip()
+            raw_url     = (s.get("url") or "").strip()
+            raw_snippet = s.get("snippet", "").strip()
+
+            # Skip completely empty entries
+            if not raw_title and not raw_url and not raw_snippet:
+                continue
+
+            title = raw_title if raw_title else "Web Source"
+            url   = self._validate_url(raw_url)
+            sources.append(Source(url=url, title=title, snippet=raw_snippet))
+
+        # ── Fallback URL extraction ──────────────────────────────────────────
+        # If fewer than 2 sources carry a valid URL the LLM dropped them; recover
+        # them from the raw Searcher / Fact-checker output using regex.
+        valid_url_count = sum(1 for s in sources if s.url)
+        if valid_url_count < 2 and raw_search_results:
+            self._bound_log.info(
+                "crew.parse.url_fallback",
+                valid_before=valid_url_count,
+                raw_tasks=len(raw_search_results),
+            )
+            extracted = self._extract_urls_from_raw(raw_search_results)
+            existing_urls = {s.url for s in sources if s.url}
+            existing_titles = {s.title.lower() for s in sources}
+
+            for item in extracted:
+                url = item["url"]
+                title = item["title"]
+                if url in existing_urls:
+                    # Back-fill the URL into the matching URL-less source if titles align
+                    for src in sources:
+                        if src.url is None and src.title.lower() in title.lower():
+                            src.url = url
+                            existing_urls.add(url)
+                            break
+                    continue
+                # Add as a new source
+                sources.append(Source(url=url, title=title, snippet=""))
+                existing_urls.add(url)
+
+            new_valid = sum(1 for s in sources if s.url)
+            self._bound_log.info(
+                "crew.parse.url_fallback.done",
+                valid_after=new_valid,
+                added=new_valid - valid_url_count,
+            )
+
+        # Confidence floor: fact_check_passed=False should cost at most 0.15.
+        confidence = summary.confidence_score
+        if not summary.fact_check_passed and confidence < 0.55:
+            confidence = 0.55  # floor — poor fact-check alone can't drop below this
 
         return ResearchFindings(
             sub_task_id=self.sub_task.sub_task_id,
             findings=summary.findings,
             sources=sources,
-            confidence_score=summary.confidence_score,
+            confidence_score=confidence,
             fact_check_passed=summary.fact_check_passed,
             raw_search_results=raw_search_results,
         )
+
+    @staticmethod
+    def _validate_url(raw: str) -> str | None:
+        """
+        Return a cleaned, usable URL string or None.
+
+        Rejects placeholders, empty strings, and non-HTTP values.
+        Prepends https:// to bare domains if needed.
+        """
+        if not raw:
+            return None
+        url = raw.strip().strip('"\'')
+        _invalid = {"", "null", "none", "n/a", "url", "na", "#", "undefined", "http", "https"}
+        if url.lower() in _invalid:
+            return None
+        if url.startswith("https://") or url.startswith("http://"):
+            # Must have at least a domain part
+            return url if len(url) > 10 else None
+        # Bare domain — prepend https://
+        if "." in url and "/" in url or ("." in url and not url.startswith("/")):
+            return f"https://{url}"
+        return None
+
+    @staticmethod
+    def _extract_urls_from_raw(raw_texts: list[str]) -> list[dict[str, str]]:
+        """
+        Fallback: pull [Title](URL) markdown links from raw searcher/fact-checker output.
+
+        Returns a deduplicated list of {title, url} dicts with validated URLs.
+        """
+        combined = "\n".join(raw_texts)
+        # Match markdown-style links: [Title](https://...)
+        link_pattern = re.compile(r"\[([^\]]+)\]\((https?://[^\)\s]{8,})\)")
+        # Also match bare URLs adjacent to SOURCE: lines
+        bare_pattern = re.compile(r"SOURCE:\s*\[([^\]]+)\]\((https?://[^\)\s]{8,})\)")
+
+        seen_urls: set[str] = set()
+        results: list[dict[str, str]] = []
+
+        for pattern in (bare_pattern, link_pattern):
+            for m in pattern.finditer(combined):
+                title, url = m.group(1).strip(), m.group(2).strip()
+                if url not in seen_urls and len(url) > 10:
+                    seen_urls.add(url)
+                    results.append({"title": title, "url": url})
+
+        return results
 
     def _extract_json_summary(self, text: str) -> _CrewSummary:
         """

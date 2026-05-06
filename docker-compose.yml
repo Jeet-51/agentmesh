@@ -14,11 +14,11 @@ version: "3.9"
 # frontend       :3000   React + TypeScript UI
 
 x-shared-env: &shared-env
-  PYTHONPATH: /shared:/app
+  PYTHONPATH: /app/shared:/app
   LOG_FORMAT: json
 
 x-shared-vol: &shared-vol
-  - shared-code:/shared:ro      # shared/ package mounted read-only in every container
+  - ./shared:/app/shared:ro     # shared/ package bind-mounted read-only in every container
 
 services:
 
@@ -181,7 +181,10 @@ services:
       CORS_ORIGINS: "http://localhost:3000,http://127.0.0.1:3000"
       GATEWAY_POLL_INTERVAL: "2.5"
       GATEWAY_SSE_KEEPALIVE: "25.0"
-    volumes: *shared-vol
+      EVAL_DB_PATH: /app/evals/agentmesh_evals.db   # path inside container
+    volumes:
+      - ./shared:/app/shared:ro     # shared/ package (read-only)
+      - ./evals:/app/evals          # eval framework + SQLite DB (read-write)
     env_file: .env
     depends_on:
       orchestrator:
@@ -211,14 +214,3 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-# -------------------------------------------------------------------------
-# Volumes
-# -------------------------------------------------------------------------
-
-volumes:
-  shared-code:
-    driver: local
-    driver_opts:
-      type: none
-      o: bind
-      device: ${PWD}/shared     # bind-mount the ./shared directory

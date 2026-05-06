@@ -220,8 +220,12 @@ class Citation(BaseModel):
     source_url: str | None = Field(default=None)
     source_title: str = Field(..., min_length=1)
     claim: str = Field(..., description="The specific claim this citation supports.")
-    tool_used: Literal["yfinance", "wikipedia", "edgar", "crewai_research"] = Field(
+    tool_used: Literal["yfinance", "wikipedia", "edgar", "crewai_research", "newsapi"] = Field(
         ..., description="Which MCP tool or agent produced this citation."
+    )
+    published_at: str | None = Field(
+        default=None,
+        description="ISO-8601 publication date of the source (populated for newsapi citations).",
     )
 
 

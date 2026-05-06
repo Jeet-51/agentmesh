@@ -25,7 +25,7 @@ from langgraph.types import Command
 
 from shared.models import OrchestratorState, ReportStatus
 
-from agents.orchestrator.nodes import (
+from nodes import (
     decompose_query,
     dispatch_tasks,
     human_checkpoint,

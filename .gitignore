@@ -26,3 +26,11 @@ frontend/build/
 # OS
 .DS_Store
 Thumbs.db
+
+# Eval database (local run history — do not commit)
+evals/*.db
+evals/*.db-shm
+evals/*.db-wal
+
+# Claude Code session files
+.claude/
